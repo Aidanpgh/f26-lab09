@@ -158,36 +158,138 @@ files.
 
 ## Milestone 2: Run it as copies
 
-**Your stack.** The command that brought the stack up with two copies, and how
-many distinct `X-Upstream` values your runs saw.
+**Your stack.** `compose.yaml` at the root (`name: lab09`, services `api`,
+`proxy`, and `k6`, with k6 under a `load` profile so `up` never starts it).
+
+```
+docker compose up -d --build --scale api=2 api proxy
+docker compose ps                  # lab09-api-1, lab09-api-2, lab09-proxy-1
+docker compose logs api            # each copy's u-1 / u-2 tokens
+sleep 6                            # the proxy re-resolves `api` every 5 s
+docker compose run --rm --no-deps k6 run /load/<script>.js -e ...
+```
+
+`tokens.js` runs saw **2 distinct `X-Upstream` values** (`172.20.0.2:8080`
+and `172.20.0.3:8080`). The script turns that into a threshold
+(`upstreams_seen value>=2`), so a run that only reached one copy fails rather
+than counting as evidence. `docker inspect` maps each address to a copy, and
+the mapping changes when the stack is recreated. `bookings.js` does not go
+through the proxy, so it has no `X-Upstream`. It names each copy by container
+name instead.
 
 ### Finding 1: tokens
 
-**The claim.** One sentence, the one your script checks.
+**The claim.** A token works on any request, whichever copy answers it.
 
-**The script and its result.** The file in `load/`, its threshold, and what a
-run printed.
+**The script and its result.** `load/tokens.js` sends one copy's `u-1` token
+through `http://proxy` to `GET /bookings` 40 times. That endpoint needs nothing
+but a valid token. The script tallies 200s per `X-Upstream`. Thresholds:
+`token_accepted rate==1` (the claim) and `upstreams_seen value>=2` (the run
+reached both copies). Run with api-1's token on a fresh stack (api-1 =
+`.0.3`):
 
-**Why, from the code.** The class that keeps tokens and how it is wired into
-each copy. Say how you found it.
+```
+X-Upstream 172.20.0.2:8080: 0 accepted, 22 refused
+X-Upstream 172.20.0.3:8080: 18 accepted, 0 refused
+✗ token_accepted 'rate==1' rate=45.00%
+✓ upstreams_seen 'value>=2' value=2           exit 99
+```
 
-**The kind of problem.** Use the vocabulary from lecture.
+Every refusal is `401 {"error":"invalid_token"}` from the *other* copy. The
+split is not even, because nginx gets both addresses from Docker DNS. Seen
+both ways: with `--scale api=1` the same script gets `40 accepted, 0 refused`
+and `token_accepted` passes, but `upstreams_seen value=1` fails the run,
+because one copy cannot speak to the claim.
+
+**Why, from the code.** Tokens live in `TokenService.byValue`, a plain
+`LinkedHashMap` in the JVM's heap (`accounts/.../TokenService.java:31`).
+`CampusReservePlatform`'s constructor builds a new `TokenService` with
+`TokenMinter.random()` (32 bytes from `SecureRandom`) at line 53, so each copy
+has its own map. `CampusReserveServer.main` (lines 35–36) issues the printed
+tokens into that copy's map only. A request reaches `RequestAuth.require` →
+`AuthorizationService.authenticateHeader` → `TokenService.authenticate` →
+`find` → `byValue.get(value)`. On the copy that did not mint the token, that
+returns empty, which becomes `invalid_token` / 401. The account `u-1` exists on
+both copies, because both seed the same accounts. The *token* does not.
+How I found it: I followed the call chain from `BookingsHandler.create` down,
+then ran `grep -rn "new TokenService" */src/main`, which finds exactly one
+construction site (`CampusReservePlatform.java:53`), run once per process.
+
+**The kind of problem.** The service is **stateful**. Session state is kept in
+each instance's memory, so the copies are not interchangeable and the
+load balancer would need **sticky sessions** to hide it. "Any copy can serve any
+request" is the assumption that horizontal scaling rests on, and the copies'
+local state breaks it.
 
 ### Finding 2: bookings
 
-**The claim.**
+**The claim.** A room slot is booked at most once.
 
-**The script and its result.** Say how it reaches each copy directly, and why
-it has to.
+**The script and its result.** `load/bookings.js` asks for the same room
+(`r-1`) and the same random 60-minute slot twice: once on api-1 as api-1's
+`u-1`, and once on api-2 as api-2's `u-2`. It then counts confirmations. Each
+ask goes **straight to a copy** (`http://lab09-api-1:8080`,
+`http://lab09-api-2:8080`, the names from `docker compose ps`). Through the
+proxy, Finding 1 would refuse about half of the asks with a 401 before the
+slot was ever checked, and that hides the second problem behind the first.
+Thresholds: `slot_confirmed count<=1` (the claim) and `ask_answered rate==1`
+(each ask was authenticated and judged as 201/202/409, so a bad token or an
+invalid slot cannot pass by confirming nothing). The script cancels what it
+made, so it can be rerun.
 
-**Why, from the code.**
+```
+room r-1, slot 2026-11-10T12:00:00Z for 60 minutes
+ask A -> http://lab09-api-1:8080: 201 confirmed
+ask B -> http://lab09-api-2:8080: 201 confirmed
+✓ ask_answered 'rate==1' rate=100.00%
+✗ slot_confirmed 'count<=1' count=2            exit 99
+```
 
-**The kind of problem.**
+Seen both ways: pointing B at api-1 too (with api-1's `u-2` token) gives
+`201 confirmed`, then `202 waitlisted`, and the run passes with `count=1`.
+`ask_answered` has also failed for real. My first version picked slots too far
+out, both asks came back `400 too-far-in-advance`, and `slot_confirmed=0`
+would have "passed" without that guard.
+
+**Why, from the code.** `BookingService.requestBooking` is a
+check-then-act. It reads the room's calendar
+(`bookings.findActiveByRoom`, `BookingService.java:112`), asks
+`ConflictChecker` (line 113), and only then saves (line 124). The calendar it
+reads is `InMemoryBookingStore`, a `ConcurrentHashMap` inside
+`InMemoryRecordStore` (`storage/.../InMemoryRecordStore.java:24`), built by
+`StoreRegistry.inMemory()` from `CampusReservePlatform.java:44`, once per
+process. api-2's check reads api-2's map, which has never heard of api-1's
+booking, so both checks pass and both saves succeed. Inside one copy the same
+check-then-act is safe for a different reason: `HttpApiServer` calls
+`server.setExecutor(null)` (`HttpApiServer.java:39`), so the JDK server runs
+every request on its single dispatcher thread, one at a time. How I found it:
+I traced `BookingsHandler.create` → `requestBooking`, then
+`grep -rn "StoreRegistry\.\(inMemory\|with\)(" */src/main`.
+
+**The kind of problem.** A **consistency** problem, and it is about
+correctness, not availability. An invariant ("no two held bookings of a room
+overlap") is enforced by a **check-then-act (TOCTOU) over local state**. Each
+copy is its own source of truth (**split brain**), so the invariant holds per
+copy but not globally, and the result is a silent double booking with no
+error anywhere. Making the store shared would not be enough by itself: two
+copies could still both check before either saves, so the check and the write
+need to be one atomic step where the data lives.
 
 ### What you checked
 
-One thing your agent proposed that you checked (what it proposed, how you
-checked it, and what came of it).
+**What the agent proposed.** The first draft of `bookings.js` picked a slot
+7–50 days out. The agent had read `BookingPolicy.defaults()` as allowing
+bookings up to 60 days ahead.
+
+**How I checked it.** I ran it. Both asks came back
+`400 too-far-in-advance`, and the `ask_answered` threshold failed the run. I
+then read `BookingRules.java:91-93` and `effectiveMaxAdvanceDays` (line 157):
+the limit is the stricter of the policy (60) and the room kind's own window,
+and `RoomKind.STUDY_ROOM` (`r-1`) is 14 days.
+
+**What came of it.** The script now picks a slot 2–12 days out. The guard
+threshold stayed, since it had just shown that without it the script could
+"pass" on a run that tested nothing.
 
 ---
 
