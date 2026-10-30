@@ -295,19 +295,133 @@ threshold stayed, since it had just shown that without it the script could
 
 ## Milestone 3: One boundary
 
-Take one problem from Milestone 1 or 2 and propose the boundary that fixes it.
+**The problem.** Finding 1: a token only works on the copy that minted it,
+because each copy keeps its tokens in its own `TokenService.byValue` map
+(`TokenService.java:31`, built per process at `CampusReservePlatform.java:53`).
+"Done" means `load/tokens.js` passes, unchanged, against two copies:
+`token_accepted rate==1` with `upstreams_seen value>=2`.
 
-**The boundary.** The port, what it promises, and which side implements it. Say what
-moves and what stays.
+**The boundary.** A `TokenStore` port, declared in `accounts` the same way
+`core-domain` declares its stores under `core/ports/`:
 
-**Who owns the data.** Name the module that owns the data this boundary is about,
-and say what everybody else is allowed to do with it.
+```java
+public interface TokenStore {
+    /** Stores a new token and, in the same atomic step, drops that user's oldest
+     *  live tokens past {@code limit}. Stores nothing and returns false if the
+     *  value is already taken. */
+    boolean insert(Token token, int limit, Instant now);
+    Optional<Token> find(String value);
+    /** True for exactly one caller, however many copies race to remove it. */
+    boolean remove(String value);
+    int removeAllFor(String userId);
+    List<Token> liveFor(String userId, Instant now);   // oldest first
+    int removeExpired(Instant now);
+}
+```
 
-**The one invariant that must not cross.** Exactly one, stated so that a reader
-can tell whether a given piece of code violates it.
+What it promises: every copy sees the same records. A write that returns
+(insert or remove) is visible to the next `find` on any copy, and `insert` and
+`remove` are atomic across copies.
 
-**What the boundary costs.** An interface to keep, a second implementation to
-maintain, a performance argument to have again. Include what it leaves unfixed.
+Who implements it:
+- `InMemoryTokenStore`, in `accounts`. Today's map moved behind the port, used
+  by tests and by a single process.
+- `SharedTokenStore`, in a new module `sessions` (depends on `accounts`). It
+  talks to one shared key-value service, a fourth Compose service (Redis), keyed
+  by token value, with a per-user index for "oldest first".
 
-Feel free to read the appendix on what a good proposal looks like in the Lab 3 handout
-before you write this section.
+What moves: `byValue` and every map operation on it (`issue`'s `putIfAbsent`,
+`find`, `revoke`, `revokeAllFor`, `purgeExpired`, `tokensFor`,
+`dropOldestPastLimit`) go behind `TokenStore`.
+
+What stays: `TokenService`'s public API and every rule in it (lifetime bounds,
+expiry checked on every read, the session limit, refresh = revoke + issue).
+`TokenMinter`, `Token`, `AuthorizationService`, `RequestAuth`, and
+`AccountDirectory` stay too. The existing three-argument `TokenService`
+constructor keeps building an `InMemoryTokenStore`, so `ServicesTest` runs
+unchanged.
+
+Wiring changes in one place: `CampusReservePlatform` passes the store in, and
+`CampusReserveServer` picks `SharedTokenStore` when the sessions address is set
+in its environment. `AGENTS.md` rule 1 gets two new edges, `sessions →
+accounts` and `http-api → sessions`, written into the table first, as the rule
+requires.
+
+**Who owns the data.** `accounts` owns token records: their shape (`Token`),
+when one is valid (expiry, active account), how many a user may hold, and the
+rule that a full value is never logged (`Token.maskedValue`). Everyone else:
+- **`sessions`** stores and returns records and nothing more. It never decides
+  whether a token is valid. If it expires keys on a TTL, that only reclaims
+  memory, like `purgeExpired`, because `TokenService` still checks `expiresAt`
+  on every read.
+- **`http-api`** asks only through `RequestAuth` → `AuthorizationService`, and
+  issues only through `TokenService`. It never touches `TokenStore`.
+- **Nobody else** reads token records. `core-domain`, `storage`, `cli`, and
+  `analytics` never see them.
+
+**The one invariant that must not cross.** *A token record lives only behind
+`TokenStore`.* No class other than a `TokenStore` implementation holds `Token`
+records keyed by value: no `Map<String, Token>` field, no cache, no copy
+"for speed". As a result, whether a value authenticates never depends on which
+copy is asked. To check a piece of code, grep `src/main` for fields of type
+`Map<String, Token>` or `Collection<Token>` outside `*TokenStore`. Today that
+grep finds one, `TokenService.byValue`, and that is the bug.
+
+**What the boundary costs.**
+1. **A network round trip on every authenticated request.** Today
+   authentication is a `HashMap.get` in the same process. With the shared store,
+   every `POST/GET/PATCH/DELETE /bookings` and `/waitlist` call does at least
+   one store read, and `issue` does an atomic insert-and-trim. My runs measured
+   a median `http_req_duration` of about 2 ms through the proxy. I have not
+   measured a store hop on this Docker network. I'd expect a fraction of a
+   millisecond, which would be a visible share of that 2 ms. Before adopting it,
+   rerun `tokens.js` and compare p95. Public reads (`/rooms`, availability)
+   pay nothing.
+2. **A new way to fail.** If the store is down, every authenticated endpoint
+   fails on every copy, so the copies stop being independent for anything that
+   needs a login. It also needs a new `DenialReason` (`sessions-unavailable` →
+   **503**, not 401). A 401 would tell clients to sign in again, and that fails
+   too. That status change goes in `accounts` (`DenialReason`) and is mapped by
+   `RequestAuth`.
+3. **Atomicity we now have to build.** `TokenService` says it is "not safe for
+   use from several threads", and today the single-threaded `HttpApiServer`
+   hides that. With two copies, two `issue`s for the same user can both see 9
+   live tokens and both insert, which breaks the 10-session limit that
+   `ServicesTest.keepsOnlyTheNewestSessionsWhenTheLimitIsReached` pins. That is
+   why `insert` must trim in the same atomic step (a Redis transaction or
+   script). `refresh` must also change to issue only when `remove(old)` returned
+   true. Otherwise two copies refreshing one token both mint a replacement.
+4. **A second implementation to keep in step.** `InMemoryTokenStore` and
+   `SharedTokenStore` both need one contract test suite, run against each, the
+   way `storage`'s tests run against the core ports. Cross-copy revocation can
+   only be tested there, because no HTTP endpoint revokes a token.
+5. **The "no runtime dependencies" claim.** A Redis client jar is the first
+   runtime dependency in the build: it changes the `Dockerfile` classpath, the
+   README, and `ARCHITECTURE.md`. The alternative is a small hand-written client
+   for the few commands we need, in the same spirit as `EventLogFormat` writing
+   JSON by hand. Either way, it is code we own.
+6. **Copies now share a session budget.** Each copy issues a token for `u-1`
+   and `u-2` at startup (`CampusReserveServer.java:35-36`). With a shared limit
+   of 10, the 11th copy to start evicts the 1st copy's printed tokens.
+
+**Alternatives, and why not.**
+- **Sticky sessions in nginx** (hash on `Authorization`): a config-only change
+  with zero code. But the claim stays false: when a copy dies or is scaled away,
+  its users are logged out, and `tokens.js` still fails.
+- **Signed stateless tokens** (HMAC, no store): no network hop, no new service.
+  But revocation, refresh ("the old value is gone"), and the session limit are
+  pinned by `ServicesTest` (lines 143–185), and they need shared state to work
+  across copies. A shared deny-list is the shared store again, plus a shared
+  signing secret to distribute and rotate.
+
+**What it leaves unfixed.**
+- **Finding 2, the double booking.** Bookings are still per copy. Fixing tokens
+  makes that problem *more* visible: through the proxy a user's booking now
+  "disappears" whenever the other copy answers `GET /bookings`, and two people
+  can double-book without addressing copies directly. The next boundary is a
+  shared booking store whose insert checks for overlaps atomically.
+- **Accounts are still per copy** (`AccountDirectory`). Deactivating someone on
+  one copy does not stop their (now shared) token on another, because
+  `authenticate` checks `directory.find(...).active()` locally.
+- **The outbox and event log are still per copy**, and the shared store is a
+  single point of failure (cost 2).
